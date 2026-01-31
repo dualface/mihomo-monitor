@@ -267,7 +267,6 @@ async def auto_select_once(
     current = await get_current_proxy(session, config)
     delays = await get_group_delays(session, config)
     delays.sort(key=lambda item: item.delay_ms)
-    delays = delays[:10]
 
     if not delays:
         if json_output:
@@ -280,20 +279,26 @@ async def auto_select_once(
     delay_map = {item.name: item.delay_ms for item in delays}
     current_delay = delay_map.get(current) if current else None
 
+    delays = delays[:10]
+
     should_switch = False
     reason = ""
     if current is None:
-        should_switch = True
-        reason = "current proxy not found"
+        should_switch = False
+        reason = "current proxy not found, keeping best as target"
     elif current_delay is None:
-        should_switch = True
-        reason = "current delay unavailable"
+        should_switch = False
+        reason = "current delay unavailable, keeping current"
     elif (
         best.name != current
+        and current_delay > 1000
         and (current_delay - best.delay_ms) > config.auto_select_diff_ms
     ):
         should_switch = True
-        reason = "current slower than best"
+        reason = "current slower than best and delay > 1000ms"
+    elif current is not None and current_delay is not None and current_delay <= 1000:
+        should_switch = False
+        reason = "current delay <= 1000ms, keeping current"
 
     if should_switch and best.name != current:
         await switch_proxy(session, config, best)
