@@ -8,7 +8,10 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
+import time
+
 import aiohttp
+from aiohttp_socks import ProxyConnector
 from dotenv import load_dotenv
 
 
@@ -21,6 +24,9 @@ class Config:
     delay_timeout_ms: int
     auto_select_diff_ms: int
     monitor_interval_s: int
+    endpoint_urls: List[str]
+    keep_delay_threshold_ms: int
+    proxy_addr: str
 
 
 @dataclass
@@ -38,6 +44,11 @@ def load_config() -> Config:
     if not controller_url:
         raise ValueError("MIHOMO_CONTROLLER_URL is required")
 
+    raw_endpoints = os.getenv("ENDPOINT_URLS", "").strip()
+    endpoint_urls = [u.strip() for u in raw_endpoints.split(",") if u.strip()] if raw_endpoints else []
+
+    proxy_addr = os.getenv("MIHOMO_PROXY_ADDR", "").strip()
+
     return Config(
         controller_url=controller_url.rstrip("/"),
         controller_secret=controller_secret,
@@ -45,7 +56,10 @@ def load_config() -> Config:
         test_url=os.getenv("TEST_URL", "https://google.com").strip(),
         delay_timeout_ms=int(os.getenv("DELAY_TIMEOUT_MS", "3000")),
         auto_select_diff_ms=int(os.getenv("AUTO_SELECT_DIFF_MS", "300")),
-        monitor_interval_s=int(os.getenv("MONITOR_INTERVAL_S", "60")),
+        monitor_interval_s=int(os.getenv("MONITOR_INTERVAL_S", "300")),
+        endpoint_urls=endpoint_urls,
+        keep_delay_threshold_ms=int(os.getenv("KEEP_DELAY_THRESHOLD_MS", "2000")),
+        proxy_addr=proxy_addr,
     )
 
 
@@ -53,6 +67,43 @@ def auth_headers(secret: str) -> Dict[str, str]:
     if not secret:
         return {}
     return {"Authorization": f"Bearer {secret}"}
+
+
+@dataclass
+class EndpointResult:
+    url: str
+    reachable: bool
+    latency_ms: int
+
+
+async def check_endpoint(
+    proxy_addr: str,
+    url: str,
+    timeout_s: float = 10.0,
+) -> EndpointResult:
+    try:
+        connector = ProxyConnector.from_url(proxy_addr)
+        async with aiohttp.ClientSession(connector=connector) as proxy_session:
+            t0 = time.monotonic()
+            async with proxy_session.head(
+                url,
+                timeout=aiohttp.ClientTimeout(total=timeout_s),
+                allow_redirects=True,
+            ) as resp:
+                latency_ms = int((time.monotonic() - t0) * 1000)
+                return EndpointResult(url=url, reachable=resp.status < 500, latency_ms=latency_ms)
+    except Exception:
+        return EndpointResult(url=url, reachable=False, latency_ms=-1)
+
+
+async def check_all_endpoints(
+    proxy_addr: str,
+    urls: List[str],
+) -> List[EndpointResult]:
+    if not urls or not proxy_addr:
+        return []
+    tasks = [check_endpoint(proxy_addr, url) for url in urls]
+    return await asyncio.gather(*tasks)
 
 
 async def get_group_delays(
@@ -279,26 +330,39 @@ async def auto_select_once(
     delay_map = {item.name: item.delay_ms for item in delays}
     current_delay = delay_map.get(current) if current else None
 
-    delays = delays[:10]
+    endpoint_results: List[EndpointResult] = []
+    all_endpoints_ok = True
+    if config.endpoint_urls and config.proxy_addr:
+        endpoint_results = await check_all_endpoints(config.proxy_addr, config.endpoint_urls)
+        all_endpoints_ok = all(r.reachable for r in endpoint_results)
 
     should_switch = False
     reason = ""
+
     if current is None:
         should_switch = False
-        reason = "current proxy not found, keeping best as target"
+        reason = "current proxy not found"
     elif current_delay is None:
         should_switch = False
         reason = "current delay unavailable, keeping current"
+    elif not all_endpoints_ok:
+        should_switch = True
+        failed = [r.url for r in endpoint_results if not r.reachable]
+        reason = f"endpoints unreachable: {', '.join(failed)}"
+    elif current_delay <= config.keep_delay_threshold_ms:
+        should_switch = False
+        reason = f"endpoints ok, delay {current_delay}ms <= {config.keep_delay_threshold_ms}ms threshold"
     elif (
         best.name != current
-        and current_delay > 1000
         and (current_delay - best.delay_ms) > config.auto_select_diff_ms
     ):
         should_switch = True
-        reason = "current slower than best and delay > 1000ms"
-    elif current is not None and current_delay is not None and current_delay <= 1000:
+        reason = f"delay {current_delay}ms > {config.keep_delay_threshold_ms}ms and best is {current_delay - best.delay_ms}ms faster"
+    else:
         should_switch = False
-        reason = "current delay <= 1000ms, keeping current"
+        reason = f"delay {current_delay}ms > threshold but no significantly better option"
+
+    ep_summary = [{"url": r.url, "reachable": r.reachable, "latency_ms": r.latency_ms} for r in endpoint_results]
 
     if should_switch and best.name != current:
         await switch_proxy(session, config, best)
@@ -309,6 +373,7 @@ async def auto_select_once(
             "from_delay_ms": current_delay,
             "to_delay_ms": best.delay_ms,
             "reason": reason,
+            "endpoints": ep_summary,
         }
     else:
         result = {
@@ -317,6 +382,8 @@ async def auto_select_once(
             "delay_ms": current_delay,
             "best": best.name,
             "best_delay_ms": best.delay_ms,
+            "reason": reason,
+            "endpoints": ep_summary,
         }
 
     if json_output:
@@ -326,11 +393,11 @@ async def auto_select_once(
         from_name = sanitize_name(current or "")
         to_name = sanitize_name(best.name)
         print(
-            f"switched\t{from_name}\t{current_delay}ms -> {best.delay_ms}ms\t{to_name}"
+            f"switched\t{from_name}\t{current_delay}ms -> {best.delay_ms}ms\t{to_name}\t({reason})"
         )
         return
     keep_name = sanitize_name(current or "")
-    print(f"kept\t{current_delay}ms\t{keep_name}")
+    print(f"kept\t{current_delay}ms\t{keep_name}\t({reason})")
 
 
 async def monitor_loop(
