@@ -1,0 +1,17 @@
+[Unit]
+Description=Mihomo Monitor Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/mihomo-monitor.env
+WorkingDirectory=/var/lib/mihomo-monitor
+ExecStart=/usr/local/bin/mihomo-monitor --monitor
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+UnsetEnvironment=HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY http_proxy https_proxy no_proxy all_proxy
+
+[Install]
+WantedBy=multi-user.target

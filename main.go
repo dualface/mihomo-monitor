@@ -103,7 +103,7 @@ func parseIntEnv(name string, defaultVal int) (int, error) {
 }
 
 func loadConfig() (Config, error) {
-	_ = godotenv.Load()
+	_ = godotenv.Overload()
 
 	controllerURL := strings.TrimSpace(os.Getenv("MIHOMO_CONTROLLER_URL"))
 	if controllerURL == "" {
@@ -138,6 +138,11 @@ func loadConfig() (Config, error) {
 		return Config{}, err
 	}
 
+	proxyAddr := strings.TrimSpace(os.Getenv("MIHOMO_PROXY_ADDR"))
+	if len(endpointURLs) > 0 && proxyAddr == "" {
+		log.Printf("Warning: ENDPOINT_URLS is set but MIHOMO_PROXY_ADDR is empty; endpoint checks are disabled")
+	}
+
 	return Config{
 		ControllerURL:        strings.TrimRight(controllerURL, "/"),
 		ControllerSecret:     strings.TrimSpace(os.Getenv("MIHOMO_CONTROLLER_SECRET")),
@@ -148,7 +153,7 @@ func loadConfig() (Config, error) {
 		MonitorIntervalS:     monitorIntervalS,
 		EndpointURLs:         endpointURLs,
 		KeepDelayThresholdMS: keepDelayThresholdMS,
-		ProxyAddr:            strings.TrimSpace(os.Getenv("MIHOMO_PROXY_ADDR")),
+		ProxyAddr:            proxyAddr,
 		FilterHKNodes:        parseBoolEnv("FILTER_HK_NODES", true),
 	}, nil
 }
@@ -348,11 +353,10 @@ func switchProxy(client *http.Client, cfg Config, candidate ProxyDelay) error {
 }
 
 func buildTransportForProxy(proxyAddr string) (*http.Transport, error) {
-	base, ok := http.DefaultTransport.(*http.Transport)
-	if !ok {
-		return nil, errors.New("default transport type assertion failed")
+	transport, err := buildBaseTransportNoEnvProxy()
+	if err != nil {
+		return nil, err
 	}
-	transport := base.Clone()
 
 	if strings.TrimSpace(proxyAddr) == "" {
 		return transport, nil
@@ -381,6 +385,16 @@ func buildTransportForProxy(proxyAddr string) (*http.Transport, error) {
 	default:
 		return nil, fmt.Errorf("unsupported proxy scheme: %s", scheme)
 	}
+}
+
+func buildBaseTransportNoEnvProxy() (*http.Transport, error) {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil, errors.New("default transport type assertion failed")
+	}
+	transport := base.Clone()
+	transport.Proxy = nil
+	return transport, nil
 }
 
 func checkEndpoint(proxyAddr, targetURL string, timeout time.Duration) EndpointResult {
@@ -684,12 +698,71 @@ func monitorLoop(client *http.Client, cfg Config, jsonOutput bool) {
 	}
 }
 
+func checkEndpointsCurrentOnce(client *http.Client, cfg Config, jsonOutput bool) {
+	current, currentFound := getCurrentProxy(client, cfg)
+
+	if len(cfg.EndpointURLs) == 0 {
+		if jsonOutput {
+			fmt.Println(mustASCIIJSON(map[string]any{"error": "ENDPOINT_URLS is empty"}))
+		} else {
+			fmt.Println("ENDPOINT_URLS is empty")
+		}
+		return
+	}
+
+	if strings.TrimSpace(cfg.ProxyAddr) == "" {
+		if jsonOutput {
+			fmt.Println(mustASCIIJSON(map[string]any{"error": "MIHOMO_PROXY_ADDR is empty"}))
+		} else {
+			fmt.Println("MIHOMO_PROXY_ADDR is empty")
+		}
+		return
+	}
+
+	endpointResults := checkAllEndpoints(cfg.ProxyAddr, cfg.EndpointURLs)
+	allReachable := true
+	for _, item := range endpointResults {
+		if !item.Reachable {
+			allReachable = false
+			break
+		}
+	}
+
+	if jsonOutput {
+		fmt.Println(mustASCIIJSON(map[string]any{
+			"current":       current,
+			"current_found": currentFound,
+			"all_reachable": allReachable,
+			"endpoints":     endpointResults,
+		}))
+		return
+	}
+
+	currentText := "unknown"
+	if currentFound {
+		currentText = sanitizeName(current)
+	}
+	status := "ok"
+	if !allReachable {
+		status = "degraded"
+	}
+	fmt.Printf("current\t%s\t%s\n", currentText, status)
+	for _, item := range endpointResults {
+		reachability := "unreachable"
+		if item.Reachable {
+			reachability = "reachable"
+		}
+		fmt.Printf("%s\t%dms\t%s\n", reachability, item.LatencyMS, item.URL)
+	}
+}
+
 type CLIArgs struct {
-	PrintDelays  bool
-	JSONOutput   bool
-	PrintCurrent bool
-	AutoSelect   bool
-	Monitor      bool
+	PrintDelays    bool
+	JSONOutput     bool
+	PrintCurrent   bool
+	AutoSelect     bool
+	Monitor        bool
+	CheckEndpoints bool
 }
 
 func parseArgs() (CLIArgs, error) {
@@ -699,6 +772,7 @@ func parseArgs() (CLIArgs, error) {
 	flag.BoolVar(&args.PrintCurrent, "print-current", false, "Print current proxy delay and exit")
 	flag.BoolVar(&args.AutoSelect, "auto-select", false, "Auto select faster proxy and exit")
 	flag.BoolVar(&args.Monitor, "monitor", false, "Run monitor loop with auto selection")
+	flag.BoolVar(&args.CheckEndpoints, "check-endpoints", false, "Test ENDPOINT_URLS via current proxy and exit")
 	flag.Parse()
 
 	actionCount := 0
@@ -714,9 +788,12 @@ func parseArgs() (CLIArgs, error) {
 	if args.Monitor {
 		actionCount++
 	}
+	if args.CheckEndpoints {
+		actionCount++
+	}
 
 	if actionCount != 1 {
-		return CLIArgs{}, errors.New("exactly one of --print-delays, --print-current, --auto-select, --monitor is required")
+		return CLIArgs{}, errors.New("exactly one of --print-delays, --print-current, --auto-select, --monitor, --check-endpoints is required")
 	}
 	return args, nil
 }
@@ -737,7 +814,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	client := &http.Client{}
+	baseTransport, err := buildBaseTransportNoEnvProxy()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+	client := &http.Client{Transport: baseTransport}
 
 	switch {
 	case args.PrintDelays:
@@ -748,5 +830,7 @@ func main() {
 		autoSelectOnce(client, cfg, args.JSONOutput)
 	case args.Monitor:
 		monitorLoop(client, cfg, args.JSONOutput)
+	case args.CheckEndpoints:
+		checkEndpointsCurrentOnce(client, cfg, args.JSONOutput)
 	}
 }
