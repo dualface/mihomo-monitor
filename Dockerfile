@@ -1,14 +1,16 @@
-FROM python:3.12-slim
+FROM golang:1.25-alpine AS builder
 
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+WORKDIR /src
 
-WORKDIR /app
+COPY . .
 
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=vendor -trimpath -ldflags="-s -w" -o /out/mihomo-monitor .
 
-COPY main.py ./
+FROM alpine:3.21
 
-ENTRYPOINT ["python", "main.py"]
+RUN apk add --no-cache ca-certificates
+
+COPY --from=builder /out/mihomo-monitor /usr/local/bin/mihomo-monitor
+
+ENTRYPOINT ["mihomo-monitor"]
 CMD ["--monitor"]

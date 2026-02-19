@@ -28,8 +28,10 @@ dist-ssr
 .env.local
 .env.*.local
 
-# Python
-*.pyc
-.venv/**/
-.venv/lib64
+# Go
+bin/
+mihomo-monitor
 
+# Local env/cache
+.venv/
+__pycache__/

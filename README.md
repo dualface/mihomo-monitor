@@ -4,15 +4,13 @@ CLI utility for Mihomo controller delay checks, current proxy inspection, auto s
 
 ## Requirements
 
-- Python 3.12+
+- Go 1.23+
 - Mihomo controller API enabled
 
 ## Install
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
+go mod download
 ```
 
 ## Configuration
@@ -40,29 +38,36 @@ Optional settings:
 Print top 10 fastest nodes:
 
 ```bash
-python main.py --print-delays
-python main.py --print-delays --json
+go run . --print-delays
+go run . --print-delays --json
 ```
 
 Print current proxy delay:
 
 ```bash
-python main.py --print-current
-python main.py --print-current --json
+go run . --print-current
+go run . --print-current --json
 ```
 
 Auto select faster proxy:
 
 ```bash
-python main.py --auto-select
-python main.py --auto-select --json
+go run . --auto-select
+go run . --auto-select --json
 ```
 
 Monitor loop (auto select every interval):
 
 ```bash
-python main.py --monitor
-python main.py --monitor --json
+go run . --monitor
+go run . --monitor --json
+```
+
+Build binary:
+
+```bash
+go build -o mihomo-monitor .
+./mihomo-monitor --monitor
 ```
 
 Notes:
