@@ -5,6 +5,6 @@ MIHOMO_PROXY_ADDR=socks5://127.0.0.1:7890
 
 ENDPOINT_URLS=https://zenmux.ai/api/v1,https://opencode.ai,https://api.telegram.org
 KEEP_DELAY_THRESHOLD_MS=2000
+FILTER_HK_NODES=true
 
 HTTP_PROXY=http://127.0.0.1:8080
-

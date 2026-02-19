@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import unicodedata
 from dataclasses import dataclass
@@ -27,12 +28,38 @@ class Config:
     endpoint_urls: List[str]
     keep_delay_threshold_ms: int
     proxy_addr: str
+    filter_hk_nodes: bool
 
 
 @dataclass
 class ProxyDelay:
     name: str
     delay_ms: int
+
+
+_HK_TOKEN_RE = re.compile(r"(^|[^a-z0-9])hk([^a-z0-9]|$)", re.IGNORECASE)
+
+
+def is_excluded_proxy(name: str) -> bool:
+    lowered = name.lower()
+    if "香港" in name:
+        return True
+    if "hong kong" in lowered:
+        return True
+    return _HK_TOKEN_RE.search(lowered) is not None
+
+
+def parse_bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    logging.warning("Invalid %s=%r, fallback to %s", name, raw, default)
+    return default
 
 
 def load_config() -> Config:
@@ -60,6 +87,7 @@ def load_config() -> Config:
         endpoint_urls=endpoint_urls,
         keep_delay_threshold_ms=int(os.getenv("KEEP_DELAY_THRESHOLD_MS", "2000")),
         proxy_addr=proxy_addr,
+        filter_hk_nodes=parse_bool_env("FILTER_HK_NODES", True),
     )
 
 
@@ -120,13 +148,13 @@ async def get_group_delays(
         ) as resp:
             resp.raise_for_status()
             payload = await resp.json()
-        return parse_group_delays(payload)
+        return parse_group_delays(payload, config.filter_hk_nodes)
     except Exception as exc:
         logging.warning("Group delay check failed: %s", exc)
         return []
 
 
-def parse_group_delays(payload: Dict[str, object]) -> List[ProxyDelay]:
+def parse_group_delays(payload: Dict[str, object], filter_hk_nodes: bool = True) -> List[ProxyDelay]:
     delays: List[ProxyDelay] = []
 
     def _to_int(value: object) -> Optional[int]:
@@ -137,6 +165,8 @@ def parse_group_delays(payload: Dict[str, object]) -> List[ProxyDelay]:
 
     if "delays" in payload and isinstance(payload["delays"], dict):
         for name, delay in payload["delays"].items():
+            if filter_hk_nodes and is_excluded_proxy(name):
+                continue
             delay_ms = _to_int(delay)
             if delay_ms is None:
                 continue
@@ -146,6 +176,8 @@ def parse_group_delays(payload: Dict[str, object]) -> List[ProxyDelay]:
 
     if all(isinstance(key, str) for key in payload.keys()):
         for name, delay in payload.items():
+            if filter_hk_nodes and is_excluded_proxy(name):
+                continue
             delay_ms = _to_int(delay)
             if delay_ms is None:
                 continue
@@ -162,6 +194,8 @@ def parse_group_delays(payload: Dict[str, object]) -> List[ProxyDelay]:
             delay = item.get("delay")
             if not isinstance(name, str):
                 continue
+            if filter_hk_nodes and is_excluded_proxy(name):
+                continue
             delay_ms = _to_int(delay)
             if delay_ms is None:
                 continue
@@ -173,6 +207,8 @@ def parse_group_delays(payload: Dict[str, object]) -> List[ProxyDelay]:
         name = payload.get("name")
         delay = payload.get("delay")
         if isinstance(name, str):
+            if filter_hk_nodes and is_excluded_proxy(name):
+                return []
             delay_ms = _to_int(delay)
             if delay_ms is not None and delay_ms >= 0:
                 return [ProxyDelay(name=name, delay_ms=delay_ms)]

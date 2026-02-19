@@ -33,6 +33,7 @@ Optional settings:
 - `DELAY_TIMEOUT_MS` (default: `3000`)
 - `AUTO_SELECT_DIFF_MS` (default: `300`)
 - `MONITOR_INTERVAL_S` (default: `60`)
+- `FILTER_HK_NODES` (default: `true`, filters `香港` / `HK` / `Hong Kong` nodes)
 
 ## Usage
 
