@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -53,6 +54,8 @@ type EndpointResult struct {
 }
 
 var hkTokenRE = regexp.MustCompile(`(?i)(^|[^a-z0-9])hk([^a-z0-9]|$)`)
+
+const endpointProbeCandidateLimit = 10
 
 func isExcludedProxy(name string) bool {
 	lowered := strings.ToLower(name)
@@ -125,17 +128,29 @@ func loadConfig() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	if delayTimeoutMS <= 0 {
+		return Config{}, errors.New("DELAY_TIMEOUT_MS must be > 0")
+	}
 	autoSelectDiffMS, err := parseIntEnv("AUTO_SELECT_DIFF_MS", 300)
 	if err != nil {
 		return Config{}, err
+	}
+	if autoSelectDiffMS < 0 {
+		return Config{}, errors.New("AUTO_SELECT_DIFF_MS must be >= 0")
 	}
 	monitorIntervalS, err := parseIntEnv("MONITOR_INTERVAL_S", 300)
 	if err != nil {
 		return Config{}, err
 	}
+	if monitorIntervalS <= 0 {
+		return Config{}, errors.New("MONITOR_INTERVAL_S must be > 0")
+	}
 	keepDelayThresholdMS, err := parseIntEnv("KEEP_DELAY_THRESHOLD_MS", 2000)
 	if err != nil {
 		return Config{}, err
+	}
+	if keepDelayThresholdMS < 0 {
+		return Config{}, errors.New("KEEP_DELAY_THRESHOLD_MS must be >= 0")
 	}
 
 	proxyAddr := strings.TrimSpace(os.Getenv("MIHOMO_PROXY_ADDR"))
@@ -289,16 +304,22 @@ func controllerRequest(client *http.Client, cfg Config, method, endpoint string,
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("request failed: %s", resp.Status)
 	}
+	if resp.StatusCode == http.StatusNoContent || resp.ContentLength == 0 {
+		return map[string]any{}, nil
+	}
 	var payload map[string]any
 	decoder := json.NewDecoder(resp.Body)
 	decoder.UseNumber()
 	if err := decoder.Decode(&payload); err != nil {
+		if errors.Is(err, io.EOF) {
+			return map[string]any{}, nil
+		}
 		return nil, err
 	}
 	return payload, nil
 }
 
-func getGroupDelays(client *http.Client, cfg Config) []ProxyDelay {
+func getGroupDelaysWithFilter(client *http.Client, cfg Config, filterHKNodes bool) []ProxyDelay {
 	endpoint := fmt.Sprintf("%s/group/%s/delay", cfg.ControllerURL, url.PathEscape(cfg.ProxyGroup))
 	params := url.Values{}
 	params.Set("url", cfg.TestURL)
@@ -310,7 +331,74 @@ func getGroupDelays(client *http.Client, cfg Config) []ProxyDelay {
 		log.Printf("Group delay check failed: %v", err)
 		return []ProxyDelay{}
 	}
-	return parseGroupDelays(payload, cfg.FilterHKNodes)
+	return parseGroupDelays(payload, filterHKNodes)
+}
+
+func getGroupDelays(client *http.Client, cfg Config) []ProxyDelay {
+	return getGroupDelaysWithFilter(client, cfg, cfg.FilterHKNodes)
+}
+
+func findBestAlternative(delays []ProxyDelay, current string) (ProxyDelay, bool) {
+	for _, item := range delays {
+		if item.Name != current {
+			return item, true
+		}
+	}
+	return ProxyDelay{}, false
+}
+
+func getProxyDelay(client *http.Client, cfg Config, proxyName, targetURL string, timeoutMS int) (int, bool) {
+	endpoint := fmt.Sprintf("%s/proxies/%s/delay", cfg.ControllerURL, url.PathEscape(proxyName))
+	params := url.Values{}
+	params.Set("url", targetURL)
+	params.Set("timeout", strconv.Itoa(timeoutMS))
+	endpoint = endpoint + "?" + params.Encode()
+
+	payload, err := controllerRequest(client, cfg, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return -1, false
+	}
+	delayRaw, ok := payload["delay"]
+	if !ok {
+		return -1, false
+	}
+	delayMS, ok := toInt(delayRaw)
+	if !ok || delayMS < 0 {
+		return -1, false
+	}
+	return delayMS, true
+}
+
+func isProxyReachableForEndpoints(client *http.Client, cfg Config, proxyName string, endpointURLs []string) bool {
+	if len(endpointURLs) == 0 {
+		return true
+	}
+	for _, target := range endpointURLs {
+		if _, ok := getProxyDelay(client, cfg, proxyName, target, cfg.DelayTimeoutMS); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func findBestReachableAlternative(client *http.Client, cfg Config, delays []ProxyDelay, current string, endpointURLs []string) (ProxyDelay, bool) {
+	if len(endpointURLs) == 0 {
+		return findBestAlternative(delays, current)
+	}
+	checked := 0
+	for _, item := range delays {
+		if item.Name == current {
+			continue
+		}
+		if checked >= endpointProbeCandidateLimit {
+			break
+		}
+		checked++
+		if isProxyReachableForEndpoints(client, cfg, item.Name, endpointURLs) {
+			return item, true
+		}
+	}
+	return ProxyDelay{}, false
 }
 
 func sanitizeName(name string) string {
@@ -525,7 +613,7 @@ func printCurrentDelayOnce(client *http.Client, cfg Config, jsonOutput bool) {
 		return
 	}
 
-	delays := getGroupDelays(client, cfg)
+	delays := getGroupDelaysWithFilter(client, cfg, false)
 	delayMap := make(map[string]int, len(delays))
 	for _, item := range delays {
 		delayMap[item.Name] = item.DelayMS
@@ -548,10 +636,17 @@ func printCurrentDelayOnce(client *http.Client, cfg Config, jsonOutput bool) {
 	fmt.Printf("%dms\t%s\n", delayMS, sanitizeName(current))
 }
 
-func autoSelectOnce(client *http.Client, cfg Config, jsonOutput bool) {
+func autoSelectOnce(client *http.Client, cfg Config, jsonOutput, dryRun bool) {
 	current, currentFound := getCurrentProxy(client, cfg)
 	delays := getGroupDelays(client, cfg)
 	sortDelays(delays)
+	if len(delays) == 0 && cfg.FilterHKNodes {
+		delays = getGroupDelaysWithFilter(client, cfg, false)
+		sortDelays(delays)
+		if len(delays) > 0 {
+			log.Printf("FILTER_HK_NODES removed all delay candidates; fallback to unfiltered delays")
+		}
+	}
 
 	if len(delays) == 0 {
 		if jsonOutput {
@@ -563,8 +658,9 @@ func autoSelectOnce(client *http.Client, cfg Config, jsonOutput bool) {
 	}
 
 	best := delays[0]
-	delayMap := make(map[string]int, len(delays))
-	for _, item := range delays {
+	allDelays := getGroupDelaysWithFilter(client, cfg, false)
+	delayMap := make(map[string]int, len(allDelays))
+	for _, item := range allDelays {
 		delayMap[item.Name] = item.DelayMS
 	}
 
@@ -593,27 +689,61 @@ func autoSelectOnce(client *http.Client, cfg Config, jsonOutput bool) {
 	if !currentFound {
 		shouldSwitch = false
 		reason = "current proxy not found"
-	} else if currentDelay == nil {
-		shouldSwitch = false
-		reason = "current delay unavailable, keeping current"
 	} else if !allEndpointsOK {
-		shouldSwitch = true
 		failed := make([]string, 0)
 		for _, item := range endpointResults {
 			if !item.Reachable {
 				failed = append(failed, item.URL)
 			}
 		}
-		reason = "endpoints unreachable: " + strings.Join(failed, ", ")
+		alt, found := findBestReachableAlternative(client, cfg, delays, current, cfg.EndpointURLs)
+		if !found {
+			alt, found = findBestAlternative(delays, current)
+			if !found {
+				shouldSwitch = false
+				reason = "endpoints unreachable but no alternative proxy available"
+			} else {
+				shouldSwitch = true
+				best = alt
+				reason = "endpoints unreachable: " + strings.Join(failed, ", ") + "; fallback to fastest alternative without endpoint verification"
+			}
+		} else {
+			shouldSwitch = true
+			best = alt
+			reason = "endpoints unreachable: " + strings.Join(failed, ", ") + "; switch to endpoint-verified alternative"
+		}
+	} else if currentDelay == nil {
+		shouldSwitch = false
+		reason = "current delay unavailable, keeping current"
 	} else if *currentDelay <= cfg.KeepDelayThresholdMS {
 		shouldSwitch = false
 		reason = fmt.Sprintf("endpoints ok, delay %dms <= %dms threshold", *currentDelay, cfg.KeepDelayThresholdMS)
-	} else if best.Name != current && (*currentDelay-best.DelayMS) > cfg.AutoSelectDiffMS {
-		shouldSwitch = true
-		reason = fmt.Sprintf("delay %dms > %dms and best is %dms faster", *currentDelay, cfg.KeepDelayThresholdMS, *currentDelay-best.DelayMS)
 	} else {
-		shouldSwitch = false
-		reason = fmt.Sprintf("delay %dms > threshold but no significantly better option", *currentDelay)
+		alt, found := findBestAlternative(delays, current)
+		if !found {
+			shouldSwitch = false
+			reason = "no alternative proxy available"
+		} else if (*currentDelay - alt.DelayMS) <= cfg.AutoSelectDiffMS {
+			shouldSwitch = false
+			reason = fmt.Sprintf("delay %dms > threshold but no significantly better option", *currentDelay)
+		} else if len(cfg.EndpointURLs) == 0 {
+			shouldSwitch = true
+			best = alt
+			reason = fmt.Sprintf("delay %dms > %dms and best is %dms faster", *currentDelay, cfg.KeepDelayThresholdMS, *currentDelay-alt.DelayMS)
+		} else {
+			reachableAlt, reachableFound := findBestReachableAlternative(client, cfg, delays, current, cfg.EndpointURLs)
+			if !reachableFound {
+				shouldSwitch = false
+				reason = fmt.Sprintf("delay %dms > threshold but no endpoint-verified alternative", *currentDelay)
+			} else if (*currentDelay - reachableAlt.DelayMS) <= cfg.AutoSelectDiffMS {
+				shouldSwitch = false
+				reason = fmt.Sprintf("delay %dms > threshold but no sufficiently faster endpoint-verified alternative", *currentDelay)
+			} else {
+				shouldSwitch = true
+				best = reachableAlt
+				reason = fmt.Sprintf("delay %dms > %dms and endpoint-verified best is %dms faster", *currentDelay, cfg.KeepDelayThresholdMS, *currentDelay-reachableAlt.DelayMS)
+			}
+		}
 	}
 
 	epSummary := make([]map[string]any, 0, len(endpointResults))
@@ -626,8 +756,53 @@ func autoSelectOnce(client *http.Client, cfg Config, jsonOutput bool) {
 	}
 
 	if shouldSwitch && best.Name != current {
+		if dryRun {
+			result := map[string]any{
+				"action":        "would_switch",
+				"dry_run":       true,
+				"from":          current,
+				"to":            best.Name,
+				"from_delay_ms": currentDelay,
+				"to_delay_ms":   best.DelayMS,
+				"reason":        reason,
+				"endpoints":     epSummary,
+			}
+			if jsonOutput {
+				fmt.Println(mustASCIIJSON(result))
+				return
+			}
+			fromName := sanitizeName(current)
+			toName := sanitizeName(best.Name)
+			currentText := "nil"
+			if currentDelay != nil {
+				currentText = fmt.Sprintf("%dms", *currentDelay)
+			}
+			fmt.Printf("would_switch(dry-run)\t%s\t%s -> %dms\t%s\t(%s)\n", fromName, currentText, best.DelayMS, toName, reason)
+			return
+		}
 		if err := switchProxy(client, cfg, best); err != nil {
-			log.Printf("Switch proxy failed: %v", err)
+			result := map[string]any{
+				"action":        "switch_failed",
+				"from":          current,
+				"to":            best.Name,
+				"from_delay_ms": currentDelay,
+				"to_delay_ms":   best.DelayMS,
+				"reason":        reason,
+				"error":         err.Error(),
+				"endpoints":     epSummary,
+			}
+			if jsonOutput {
+				fmt.Println(mustASCIIJSON(result))
+				return
+			}
+			fromName := sanitizeName(current)
+			toName := sanitizeName(best.Name)
+			currentText := "nil"
+			if currentDelay != nil {
+				currentText = fmt.Sprintf("%dms", *currentDelay)
+			}
+			fmt.Printf("switch_failed\t%s\t%s -> %dms\t%s\t(%s) err=%v\n", fromName, currentText, best.DelayMS, toName, reason, err)
+			return
 		}
 		result := map[string]any{
 			"action":        "switched",
@@ -661,6 +836,9 @@ func autoSelectOnce(client *http.Client, cfg Config, jsonOutput bool) {
 		"reason":        reason,
 		"endpoints":     epSummary,
 	}
+	if dryRun {
+		result["dry_run"] = true
+	}
 	if jsonOutput {
 		fmt.Println(mustASCIIJSON(result))
 		return
@@ -672,7 +850,7 @@ func autoSelectOnce(client *http.Client, cfg Config, jsonOutput bool) {
 	fmt.Printf("kept\t%s\t%s\t(%s)\n", currentText, sanitizeName(current), reason)
 }
 
-func monitorLoop(client *http.Client, cfg Config, jsonOutput bool) {
+func monitorLoop(client *http.Client, cfg Config, jsonOutput, dryRun bool) {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(sigCh)
@@ -685,7 +863,7 @@ func monitorLoop(client *http.Client, cfg Config, jsonOutput bool) {
 		default:
 		}
 
-		autoSelectOnce(client, cfg, jsonOutput)
+		autoSelectOnce(client, cfg, jsonOutput, dryRun)
 
 		timer := time.NewTimer(time.Duration(cfg.MonitorIntervalS) * time.Second)
 		select {
@@ -763,17 +941,27 @@ type CLIArgs struct {
 	AutoSelect     bool
 	Monitor        bool
 	CheckEndpoints bool
+	DryRun         bool
 }
 
 func parseArgs() (CLIArgs, error) {
+	return parseArgsFrom(os.Args[1:])
+}
+
+func parseArgsFrom(argv []string) (CLIArgs, error) {
 	var args CLIArgs
-	flag.BoolVar(&args.PrintDelays, "print-delays", false, "Print proxy delays for group and exit")
-	flag.BoolVar(&args.JSONOutput, "json", false, "Use JSON output when printing delays")
-	flag.BoolVar(&args.PrintCurrent, "print-current", false, "Print current proxy delay and exit")
-	flag.BoolVar(&args.AutoSelect, "auto-select", false, "Auto select faster proxy and exit")
-	flag.BoolVar(&args.Monitor, "monitor", false, "Run monitor loop with auto selection")
-	flag.BoolVar(&args.CheckEndpoints, "check-endpoints", false, "Test ENDPOINT_URLS via current proxy and exit")
-	flag.Parse()
+	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fs.BoolVar(&args.PrintDelays, "print-delays", false, "Print proxy delays for group and exit")
+	fs.BoolVar(&args.JSONOutput, "json", false, "Use JSON output when printing delays")
+	fs.BoolVar(&args.PrintCurrent, "print-current", false, "Print current proxy delay and exit")
+	fs.BoolVar(&args.AutoSelect, "auto-select", false, "Auto select faster proxy and exit")
+	fs.BoolVar(&args.Monitor, "monitor", false, "Run monitor loop with auto selection")
+	fs.BoolVar(&args.CheckEndpoints, "check-endpoints", false, "Test ENDPOINT_URLS via current proxy and exit")
+	fs.BoolVar(&args.DryRun, "dry-run", false, "Evaluate switching decision without applying proxy change")
+	if err := fs.Parse(argv); err != nil {
+		return CLIArgs{}, err
+	}
 
 	actionCount := 0
 	if args.PrintDelays {
@@ -795,7 +983,26 @@ func parseArgs() (CLIArgs, error) {
 	if actionCount != 1 {
 		return CLIArgs{}, errors.New("exactly one of --print-delays, --print-current, --auto-select, --monitor, --check-endpoints is required")
 	}
+	if args.DryRun && !(args.AutoSelect || args.Monitor) {
+		return CLIArgs{}, errors.New("--dry-run can only be used with --auto-select or --monitor")
+	}
 	return args, nil
+}
+
+func usageText() string {
+	return strings.TrimSpace(`
+Usage:
+  mihomo-monitor [--json] [--dry-run] (--print-delays | --print-current | --auto-select | --monitor | --check-endpoints)
+
+Flags:
+  --print-delays     Print top 10 proxy delays for group and exit
+  --print-current    Print current proxy delay and exit
+  --auto-select      Evaluate and switch proxy once
+  --monitor          Run monitor loop with auto selection
+  --check-endpoints  Test ENDPOINT_URLS via current proxy and exit
+  --json             Use JSON output
+  --dry-run          Only with --auto-select/--monitor; never apply switch
+`)
 }
 
 func main() {
@@ -803,9 +1010,13 @@ func main() {
 
 	args, err := parseArgs()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
-		flag.Usage()
-		os.Exit(2)
+		if !errors.Is(err, flag.ErrHelp) {
+			fmt.Fprintln(os.Stderr, err.Error())
+			fmt.Fprintln(os.Stderr, usageText())
+			os.Exit(2)
+		}
+		fmt.Fprintln(os.Stdout, usageText())
+		os.Exit(0)
 	}
 
 	cfg, err := loadConfig()
@@ -827,9 +1038,9 @@ func main() {
 	case args.PrintCurrent:
 		printCurrentDelayOnce(client, cfg, args.JSONOutput)
 	case args.AutoSelect:
-		autoSelectOnce(client, cfg, args.JSONOutput)
+		autoSelectOnce(client, cfg, args.JSONOutput, args.DryRun)
 	case args.Monitor:
-		monitorLoop(client, cfg, args.JSONOutput)
+		monitorLoop(client, cfg, args.JSONOutput, args.DryRun)
 	case args.CheckEndpoints:
 		checkEndpointsCurrentOnce(client, cfg, args.JSONOutput)
 	}
